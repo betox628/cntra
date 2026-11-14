@@ -2,13 +2,19 @@
 """
 chatgpt anon bridge -> http api
 
-  GET /?q=hello
-  GET /?q=hello&conversation_id=<id>&parent_id=<msg_id>   (continue a thread)
-  GET /?q=hello&model=auto&stream=1                       (raw text/event stream)
   GET /health
+  GET /?q=hello&token=<API_TOKEN>
+  GET /?q=hello&conversation_id=<id>&parent_id=<msg_id>&token=<API_TOKEN>
+  GET /?q=hello&model=auto&stream=1&token=<API_TOKEN>
 
-pip install requests
-python bridge.py --host 0.0.0.0 --port 8000
+env:
+  PORT         bind port (Render injects this)
+  API_TOKEN    shared secret; every request must carry ?token=
+  COOKIES_JSON optional Cookie-Editor JSON export
+  OAI_DEVICE_ID optional fixed device id
+  SENTINEL_FILE path to sentinel.json (default ./sentinel.json)
+
+render: python bridge.py
 """
 import argparse
 import base64
@@ -17,6 +23,7 @@ import json
 import os
 import random
 import re
+import sys
 import threading
 import time
 import uuid
@@ -30,33 +37,53 @@ CHATGPT = "https://chatgpt.com"
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
-# Paste your Cookie-Editor JSON export verbatim between the triple quotes
-COOKIES_JSON = r"""
-[
-  {"domain":"chatgpt.com","name":"__cflb","value":"0H28vzvP5FJafnkHxih2nYMWHNDJXXQNd9XpedyVbKZ"},
-  {"domain":".chatgpt.com","name":"__cf_bm","value":"WIjaAznqmGmzXjoFZ3C2_kfDrX_RNCzENoIfQ4i0sLo-1793039090.9313464-1.0.1.1-e1m8EMiDPnrwb36SV2A5O01R8Gos5fD2ZBUwsUo5TVOdC5DhNYIrHQltZVyN3cmSUGSuMGIXrXLDJyFCLZxNgPAABkLpRXrXRX9sdtp3QpdiahOJatdtk_mIW8qTYvGI"},
-  {"domain":".chatgpt.com","name":"oai-did","value":"478c50c2-da7c-4aa3-b3c3-36821c92610d"}
-]
-"""
+SENTINEL_FILE = os.environ.get("SENTINEL_FILE", "sentinel.json")
+try:
+    with open(SENTINEL_FILE) as f:
+        CFG = json.load(f)
+except (OSError, json.JSONDecodeError):
+    CFG = {
+        "navigator_key": [UA, "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                              "Version/17.0 Safari/605.1.15"],
+        "document_key": ["en-US", "en-GB"],
+        "window_key": ["en-US,en", "en-US,es-US,en,es"],
+    }
 
-CFG = json.load(open("sentinel.json"))
 CORES = [8, 16, 24, 32]
 
-API_TOKEN = os.environ.get("API_TOKEN")  # optional: require ?token=
+API_TOKEN = os.environ.get("API_TOKEN") or None
+DEVICE_ID = os.environ.get("OAI_DEVICE_ID") or str(uuid.uuid4())
+
 BUILD_TTL = 600
 BUILD = {"dpl": "", "scripts": [], "ts": 0.0}
 BUILD_LOCK = threading.Lock()
 _local = threading.local()
 
 
+# ---------------------------------------------------------------- log
+
+def log(msg):
+    sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    sys.stdout.flush()
+
+
 # ---------------------------------------------------------------- cookies
 
 def load_jar():
+    raw = os.environ.get("COOKIES_JSON")
     jar, device_id = {}, None
-    for c in json.loads(COOKIES_JSON):
-        jar[c["name"]] = c["value"]
-        if c["name"] == "oai-did":
-            device_id = c["value"]
+    if raw:
+        try:
+            for c in json.loads(raw):
+                jar[c["name"]] = c["value"]
+                if c["name"] == "oai-did":
+                    device_id = c["value"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            jar = {}
+    if not device_id:
+        device_id = DEVICE_ID
+    jar["oai-did"] = device_id
     return jar, device_id
 
 
@@ -246,7 +273,9 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "cgpt-bridge"
 
     def log_message(self, fmt, *a):
-        print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % a}")
+        fwd = self.headers.get("X-Forwarded-For", "")
+        who = fwd.split(",")[0].strip() or self.address_string()
+        log(f"{who} {fmt % a}")
 
     def _send_json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
@@ -300,6 +329,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
@@ -309,6 +339,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+            except Exception as e:
+                try:
+                    self.wfile.write(f"\n[error] {e}\n".encode())
+                except Exception:
+                    pass
             finally:
                 resp.close()
             return
@@ -323,6 +358,8 @@ class Handler(BaseHTTPRequestHandler):
         c, m = getattr(_local, "last_ids", (None, None))
         return self._send_json(200, {
             "msg": text,
+            "conversation_id": c,
+            "parent_id": m,
         })
 
     do_POST = do_GET
@@ -331,12 +368,13 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT") or 8000))
     a = ap.parse_args()
 
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     srv.daemon_threads = True
-    print(f"listening on http://{a.host}:{a.port}  ->  /?q=hello")
+    log(f"listening on {a.host}:{a.port}  auth={'on' if API_TOKEN else 'OFF'}  "
+        f"sentinel={'file' if os.path.exists(SENTINEL_FILE) else 'fallback'}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

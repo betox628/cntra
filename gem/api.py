@@ -2,19 +2,25 @@
 """
 gemini anon bridge -> http api
 
-  GET /?q=hello
-  GET /?q=hello&session=<id>                (continue a thread)
-  GET /?q=hello&model=thinking&stream=1     (raw text stream)
   GET /health
+  GET /?q=hello&token=<API_TOKEN>
+  GET /?q=hello&session=<id>&token=<API_TOKEN>          (continue a thread)
+  GET /?q=hello&model=thinking&stream=1&token=<API_TOKEN>
 
-pip install requests
-python bridge.py --host 0.0.0.0 --port 8000
+env:
+  PORT        bind port (Render injects this)
+  API_TOKEN   shared secret; every request must carry ?token=
+  COOKIE      optional signed-in cookie header, enables real Pro routing
+  SANITIZE=0  keep $ and / instead of collapsing them to spaces
+
+render: python bridge.py
 """
 import argparse
 import json
 import os
 import random
 import re
+import sys
 import threading
 import time
 import urllib.parse
@@ -40,10 +46,18 @@ SESSIONS = {}
 SESS_LOCK = threading.Lock()
 MAX_TURNS = 10
 
-API_TOKEN = os.environ.get("API_TOKEN")  # optional: require ?token=
-COOKIE = None                            # optional: signed-in cookie header
-KEEP_CODE = False                        # keep tool traces as markdown
+API_TOKEN = os.environ.get("API_TOKEN") or None
+COOKIE = os.environ.get("COOKIE") or None
+KEEP_CODE = os.environ.get("KEEP_CODE") == "1"
+SANITIZE = os.environ.get("SANITIZE", "1") != "0"
 _local = threading.local()
+
+
+# ---------------------------------------------------------------- log
+
+def log(msg):
+    sys.stdout.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+    sys.stdout.flush()
 
 
 # ---------------------------------------------------------------- build
@@ -140,6 +154,12 @@ CODE_FENCE_KEEP = re.compile(
 CARD_CONTENT = re.compile(r"https?://googleusercontent\.com/card_content/\d+\n?")
 
 
+def sanitize(text):
+    if not SANITIZE:
+        return text
+    return text.replace("$", " ").replace("/", " ")
+
+
 def clean_text(text, strip=True):
     if KEEP_CODE:
         text = CODE_FENCE_KEEP.sub(lambda m: "```" + (m.group(1) or ""), text)
@@ -182,7 +202,7 @@ def open_chat(prompt, mode, think):
 
 
 def iter_frames(resp):
-    """Yield cleaned assistant text deltas as they arrive."""
+    """Yield cleaned, sanitized assistant text deltas as they arrive."""
     raw_acc = ""
     emitted = ""
     for raw in resp.iter_lines():
@@ -197,7 +217,7 @@ def iter_frames(resp):
             if t == raw_acc or raw_acc.startswith(t):
                 continue
             raw_acc = t
-            c = clean_text(split_safe(t), strip=False)
+            c = sanitize(clean_text(split_safe(t), strip=False))
             if not c.startswith(emitted):
                 emitted = c
                 continue
@@ -239,7 +259,9 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "gemini-bridge"
 
     def log_message(self, fmt, *a):
-        print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % a}")
+        fwd = self.headers.get("X-Forwarded-For", "")
+        who = fwd.split(",")[0].strip() or self.address_string()
+        log(f"{who} {fmt % a}")
 
     def _send_json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode()
@@ -296,6 +318,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
             self.send_header("Connection", "close")
             self.end_headers()
             self.close_connection = True
@@ -325,8 +348,6 @@ class Handler(BaseHTTPRequestHandler):
             resp.close()
 
         remember(given, q, text)
-        text.replace("$"," ")
-        text.replace("/", " ")
         return self._send_json(200, {
             "msg": text,
             "session": sid,
@@ -339,8 +360,8 @@ def main():
     global COOKIE, KEEP_CODE
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--cookie-file", help="raw cookie header; needed for real Pro")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT") or 8000))
+    ap.add_argument("--cookie-file", help="overrides COOKIE env")
     ap.add_argument("--keep-code", action="store_true",
                     help="keep tool traces as markdown, drop only the ?query noise")
     a = ap.parse_args()
@@ -348,11 +369,12 @@ def main():
     if a.cookie_file:
         with open(a.cookie_file) as f:
             COOKIE = f.read().strip() or None
-    KEEP_CODE = a.keep_code
+    if a.keep_code:
+        KEEP_CODE = True
 
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
     srv.daemon_threads = True
-    print(f"listening on http://{a.host}:{a.port}  ->  /?q=hello")
+    log(f"listening on {a.host}:{a.port}  auth={'on' if API_TOKEN else 'OFF'}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

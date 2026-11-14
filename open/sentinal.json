@@ -1,0 +1,26 @@
+{
+  "document_key": ["_reactListeningo743lnnpvdg", "location"],
+  "navigator_key": [
+    "registerProtocolHandler-function registerProtocolHandler() { [native code] }",
+    "storage-[object StorageManager]", "locks-[object LockManager]",
+    "appCodeName-Mozilla", "permissions-[object Permissions]",
+    "share-function share() { [native code] }", "webdriver-false",
+    "vendor-Google Inc.", "mediaDevices-[object MediaDevices]",
+    "cookieEnabled-true", "virtualKeyboard-[object VirtualKeyboard]",
+    "product-Gecko", "xr-[object XRSystem]", "clipboard-[object Clipboard]",
+    "productSub-20030107", "vendorSub-", "onLine-true", "gpu-[object GPU]",
+    "pdfViewerEnabled-true", "language-en-US", "hardwareConcurrency-32",
+    "appName-Netscape", "doNotTrack", "bluetooth-[object Bluetooth]"
+  ],
+  "window_key": [
+    "0","window","self","document","name","location","customElements","history",
+    "navigation","status","closed","frames","length","top","opener","parent",
+    "navigator","origin","external","screen","innerWidth","innerHeight","scrollX",
+    "scrollY","visualViewport","outerWidth","outerHeight","devicePixelRatio",
+    "performance","crypto","indexedDB","sessionStorage","localStorage","onclick",
+    "onload","onerror","onfocus","onkeydown","onresize","onscroll","onsubmit",
+    "fetch","alert","atob","btoa","open","print","setInterval","setTimeout",
+    "structuredClone","chrome","caches","cookieStore","speechSynthesis","next",
+    "__NEXT_DATA__","_N_E","regeneratorRuntime","Intercom"
+  ]
+}

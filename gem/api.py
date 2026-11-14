@@ -348,6 +348,9 @@ class Handler(BaseHTTPRequestHandler):
             resp.close()
 
         remember(given, q, text)
+      
+        text = re.sub(r'[^a-zA-Z0-9.]', '', text)
+
         return self._send_json(200, {
             "msg": text,
             "session": sid,
